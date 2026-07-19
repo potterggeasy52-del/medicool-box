@@ -1,0 +1,11 @@
+{
+  "name": "MediCool Box",
+  "short_name": "MediCool",
+  "description": "Smart Cold Chain Monitoring System",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "background_color": "#f4f8f8",
+  "theme_color": "#075b68",
+  "lang": "th"
+}
