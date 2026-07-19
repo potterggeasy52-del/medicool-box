@@ -50,6 +50,13 @@ const statusCopy: Record<string, string> = {
   SENSOR_ERROR: "เซนเซอร์ขัดข้อง",
 };
 
+function greetingForHour(hour: number) {
+  if (hour >= 5 && hour < 12) return "สวัสดีตอนเช้า";
+  if (hour >= 12 && hour < 17) return "สวัสดีตอนบ่าย";
+  if (hour >= 17 && hour < 22) return "สวัสดีตอนเย็น";
+  return "สวัสดีตอนกลางคืน";
+}
+
 function Icon({ name }: { name: string }) {
   const icons: Record<string, string> = {
     home: "⌂", delivery: "↗", scan: "⌗", bell: "●", profile: "◉",
@@ -90,6 +97,7 @@ export default function Home() {
   const [online, setOnline] = useState(false);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
   const [history, setHistory] = useState<number[]>([]);
+  const [greeting, setGreeting] = useState("สวัสดี");
   const [scanResult, setScanResult] = useState("");
   const [cameraOn, setCameraOn] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -118,6 +126,13 @@ export default function Home() {
   }, []);
 
   useEffect(() => () => streamRef.current?.getTracks().forEach(track => track.stop()), []);
+
+  useEffect(() => {
+    const updateGreeting = () => setGreeting(greetingForHour(new Date().getHours()));
+    updateGreeting();
+    const timer = window.setInterval(updateGreeting, 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   const status = data.temperatureStatus || (data.temperature > 8 ? "HIGH" : data.temperature < 2 ? "LOW" : "NORMAL");
   const statusClass = status === "NORMAL" ? "normal" : status === "HIGH" ? "high" : "warning";
@@ -178,7 +193,7 @@ export default function Home() {
       </aside>
 
       <section className="content">
-        <header className="topbar"><div><p className="eyebrow">MEDICOOL CONTROL CENTER</p><h1>{view === "home" ? "สวัสดีตอนบ่าย" : view === "delivery" ? "ติดตามการจัดส่ง" : view === "scan" ? "สแกนกล่อง" : view === "notifications" ? "การแจ้งเตือน" : "ข้อมูลผู้ดูแล"}</h1></div><div className="sync"><span className={`live-dot ${online ? "" : "offline"}`}/><span>{online ? "ข้อมูลสด" : "ข้อมูลล่าสุด"}<small>{lastUpdate ? lastUpdate.toLocaleTimeString("th-TH", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "กำลังเชื่อมต่อ"}</small></span></div></header>
+        <header className="topbar"><div><p className="eyebrow">MEDICOOL CONTROL CENTER</p><h1>{view === "home" ? greeting : view === "delivery" ? "ติดตามการจัดส่ง" : view === "scan" ? "สแกนกล่อง" : view === "notifications" ? "การแจ้งเตือน" : "ข้อมูลผู้ดูแล"}</h1></div><div className="sync"><span className={`live-dot ${online ? "" : "offline"}`}/><span>{online ? "ข้อมูลสด" : "ข้อมูลล่าสุด"}<small>{lastUpdate ? lastUpdate.toLocaleTimeString("th-TH", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "กำลังเชื่อมต่อ"}</small></span></div></header>
 
         {view === "home" && <>
           <section className={`hero ${statusClass}`}>
