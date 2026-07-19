@@ -141,7 +141,7 @@ export default function Home() {
   const mapEmbedUrl = data.gpsValid
     ? `https://maps.google.com/maps?q=${data.latitude},${data.longitude}&z=16&output=embed`
     : "";
-  const qrImageUrl = "https://api.qrserver.com/v1/create-qr-code/?size=360x360&margin=16&data=BOX-001";
+  const qrImageUrl = `${appBasePath}/medicool-box-qr.png`;
   const notifications = useMemo(() => {
     const items = [];
     if (status === "HIGH") items.push({ level: "critical", title: "อุณหภูมิสูงเกินกำหนด", detail: `${data.temperature.toFixed(2)}°C — ตรวจสอบระบบทำความเย็น`, time: "ขณะนี้" });
@@ -177,7 +177,11 @@ export default function Home() {
     streamRef.current?.getTracks().forEach(track => track.stop());
     streamRef.current = null;
     setCameraOn(false);
-    setScanResult(value.trim().toUpperCase() === "BOX-001" ? "BOX-001" : `ไม่พบกล่อง: ${value}`);
+    const normalizedValue = value.trim();
+    const normalizedUpper = normalizedValue.toUpperCase();
+    const looksLikeMediCoolLink = /^https?:\/\//i.test(normalizedValue)
+      && (normalizedValue.toLowerCase().includes("medicool") || normalizedValue.includes("potterggeasy52-del.github.io"));
+    setScanResult(normalizedUpper === "BOX-001" || looksLikeMediCoolLink ? "BOX-001" : `ไม่พบกล่อง: ${value}`);
   }
 
   return (
