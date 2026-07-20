@@ -31,6 +31,13 @@ type BoxData = {
 
 type View = "home" | "delivery" | "scan" | "notifications" | "profile";
 
+type TemperaturePoint = {
+  temperature: number;
+  timestamp: number;
+};
+
+const historySampleInterval = 5 * 60 * 1000;
+
 const fallback: BoxData = {
   temperature: 8.25,
   temperatureStatus: "HIGH",
@@ -66,28 +73,54 @@ function Icon({ name }: { name: string }) {
   return <span className={`icon icon-${name}`} aria-hidden="true">{icons[name]}</span>;
 }
 
-function MiniChart({ points }: { points: number[] }) {
-  const width = 620;
-  const height = 180;
-  const plot = points.length > 1 ? points : [6.4, 6.8, 6.2, 7.1, 6.6, 7.4];
-  const min = Math.min(0, ...plot) - 1;
-  const max = Math.max(10, ...plot) + 1;
-  const path = plot.map((value, index) => {
-    const x = (index / Math.max(1, plot.length - 1)) * width;
-    const y = height - ((value - min) / (max - min)) * height;
+function MiniChart({ points, startedAt }: { points: TemperaturePoint[]; startedAt: number }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const height = 260;
+  const plotTop = 18;
+  const plotBottom = 218;
+  const plotHeight = plotBottom - plotTop;
+  const now = Date.now();
+  const firstTimestamp = points[0]?.timestamp ?? now;
+  const start = Math.min(startedAt || firstTimestamp, firstTimestamp);
+  const end = Math.max(now, points.at(-1)?.timestamp ?? now);
+  const slotCount = Math.max(9, Math.ceil((end - start) / historySampleInterval) + 1);
+  const width = Math.max(700, slotCount * 74);
+  const xFor = (timestamp: number) => 12 + ((timestamp - start) / Math.max(1, end - start)) * (width - 24);
+  const yFor = (temperature: number) => plotBottom - (Math.min(40, Math.max(0, temperature)) / 40) * plotHeight;
+  const path = points.map((point, index) => {
+    const x = xFor(point.timestamp);
+    const y = yFor(point.temperature);
     return `${index ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(" ");
-  const area = `${path} L${width},${height} L0,${height} Z`;
+  const timeTicks = Array.from({ length: slotCount }, (_, index) => {
+    const timestamp = Math.min(start + index * historySampleInterval, end);
+    return { timestamp, x: xFor(timestamp) };
+  });
+
+  useEffect(() => {
+    const element = scrollRef.current;
+    if (element) element.scrollLeft = element.scrollWidth;
+  }, [width, points.length]);
+
   return (
-    <div className="chart-wrap" aria-label="กราฟอุณหภูมิย้อนหลัง">
-      <div className="chart-label top">8°C</div><div className="chart-label bottom">2°C</div>
-      <svg viewBox={`0 0 ${width} ${height}`} role="img">
-        <defs><linearGradient id="chartFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#087f8c" stopOpacity=".28"/><stop offset="1" stopColor="#087f8c" stopOpacity="0"/></linearGradient></defs>
-        <line x1="0" y1="48" x2={width} y2="48" className="threshold high"/>
-        <line x1="0" y1="145" x2={width} y2="145" className="threshold low"/>
-        <path d={area} fill="url(#chartFill)"/><path d={path} className="chart-line"/>
-      </svg>
-      <div className="chart-times"><span>10:00</span><span>10:15</span><span>10:30</span><span>ขณะนี้</span></div>
+    <div className="chart-wrap" aria-label="กราฟอุณหภูมิตั้งแต่เริ่มระบบ ช่วง 0 ถึง 40 องศาเซลเซียส">
+      <div className="chart-guide"><span className="guide-dot"/>ช่วงเหมาะสม 2–8°C <small>• ทุก 5 นาที • เลื่อนเพื่อดูย้อนหลัง</small></div>
+      <div className="chart-frame">
+        <div className="chart-y-axis" aria-hidden="true">
+          {[40, 30, 20, 10, 0].map(value => <span key={value} style={{ top: `${plotTop + ((40 - value) / 40) * plotHeight}px` }}>{value}°</span>)}
+        </div>
+        <div className="chart-scroll" ref={scrollRef}>
+          <div className="chart-canvas" style={{ width: `${width}px` }}>
+            <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} role="img">
+              <rect x="0" y={yFor(8)} width={width} height={yFor(2) - yFor(8)} className="recommended-band"/>
+              {[0, 10, 20, 30, 40].map(value => <line key={value} x1="0" y1={yFor(value)} x2={width} y2={yFor(value)} className="axis-grid"/>)}
+              {timeTicks.map(({ timestamp, x }, index) => <g key={`${timestamp}-${index}`}><line x1={x} y1={plotTop} x2={x} y2={plotBottom} className="time-grid"/><text x={x} y="247" textAnchor="middle" className="chart-time-label">{new Date(timestamp).toLocaleTimeString("th-TH", { hour: "2-digit", minute: "2-digit" })}</text></g>)}
+              {path && <path d={path} className="chart-line"/>}
+              {points.map((point, index) => <circle key={`${point.timestamp}-${index}`} cx={xFor(point.timestamp)} cy={yFor(point.temperature)} r={index === points.length - 1 ? 5 : 3} className="chart-point"/>)}
+            </svg>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -97,8 +130,10 @@ export default function Home() {
   const [data, setData] = useState<BoxData>(fallback);
   const [online, setOnline] = useState(false);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
-  const [history, setHistory] = useState<number[]>([]);
+  const [history, setHistory] = useState<TemperaturePoint[]>([]);
+  const [systemStartedAt, setSystemStartedAt] = useState(Date.now());
   const lastValidTemperatureRef = useRef(fallback.temperature);
+  const lastSavedHistoryBucketRef = useRef<number | null>(null);
   const [greeting, setGreeting] = useState("สวัสดี");
   const [scanResult, setScanResult] = useState("");
   const [cameraOn, setCameraOn] = useState(false);
@@ -112,6 +147,25 @@ export default function Home() {
       lastValidTemperatureRef.current = storedTemperature;
     }
     let active = true;
+    const historyUrl = `${firebaseConfig.databaseURL}/MediCoolBoxHistory/BOX-001`;
+    const loadHistory = async () => {
+      try {
+        const response = await fetch(`${historyUrl}.json?ts=${Date.now()}`, { cache: "no-store" });
+        if (!response.ok) return;
+        const stored = await response.json();
+        const values = stored && typeof stored === "object" ? Object.values(stored) : [];
+        const restored = values
+          .map(value => value as Partial<TemperaturePoint>)
+          .filter(point => Number.isFinite(Number(point.temperature)) && Number(point.temperature) > -126 && Number(point.temperature) <= 100 && Number.isFinite(Number(point.timestamp)))
+          .map(point => ({ temperature: Number(point.temperature), timestamp: Number(point.timestamp) }))
+          .sort((a, b) => a.timestamp - b.timestamp);
+        if (!active || !restored.length) return;
+        lastSavedHistoryBucketRef.current = Math.floor(restored.at(-1)!.timestamp / historySampleInterval) * historySampleInterval;
+        setHistory(restored);
+      } catch {
+        // The live value remains available if history is temporarily unavailable.
+      }
+    };
     const load = async () => {
       try {
         const response = await fetch(`${firebaseConfig.databaseURL}/MediCoolBox.json?ts=${Date.now()}`, { cache: "no-store" });
@@ -128,14 +182,31 @@ export default function Home() {
           window.localStorage.setItem(lastValidTemperatureKey, String(rawTemperature));
         }
         const displayTemperature = temperatureIsValid ? rawTemperature : lastValidTemperatureRef.current;
+        const now = Date.now();
+        const uptimeSeconds = Number(next.uptimeSeconds);
+        if (Number.isFinite(uptimeSeconds) && uptimeSeconds >= 0) {
+          setSystemStartedAt(now - uptimeSeconds * 1000);
+        }
         setData({ ...fallback, ...next, temperature: displayTemperature });
         setOnline(true);
-        setLastUpdate(new Date());
-        setHistory(old => [...old, displayTemperature].slice(-24));
+        setLastUpdate(new Date(now));
+
+        const historyBucket = Math.floor(now / historySampleInterval) * historySampleInterval;
+        if (temperatureIsValid && lastSavedHistoryBucketRef.current !== historyBucket) {
+          lastSavedHistoryBucketRef.current = historyBucket;
+          const point = { temperature: rawTemperature, timestamp: now };
+          setHistory(old => [...old.filter(item => Math.floor(item.timestamp / historySampleInterval) !== historyBucket), point].sort((a, b) => a.timestamp - b.timestamp));
+          fetch(`${historyUrl}/${historyBucket}.json`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(point),
+          }).catch(() => undefined);
+        }
       } catch {
         if (active) setOnline(false);
       }
     };
+    loadHistory();
     load();
     const timer = window.setInterval(load, 2000);
     return () => { active = false; window.clearInterval(timer); };
@@ -151,6 +222,14 @@ export default function Home() {
   }, []);
 
   const status = data.temperatureStatus || (data.temperature > 8 ? "HIGH" : data.temperature < 2 ? "LOW" : "NORMAL");
+  const chartPoints = useMemo(() => {
+    const liveTimestamp = lastUpdate?.getTime() ?? Date.now();
+    const livePoint = { temperature: data.temperature, timestamp: liveTimestamp };
+    const combined = [...history];
+    const lastPoint = combined.at(-1);
+    if (!lastPoint || liveTimestamp > lastPoint.timestamp) combined.push(livePoint);
+    return combined;
+  }, [history, data.temperature, lastUpdate]);
   const statusClass = status === "NORMAL" ? "normal" : status === "HIGH" ? "high" : "warning";
   const wifiLabel = data.wifiRSSI >= -50 ? "ดีมาก" : data.wifiRSSI >= -67 ? "ดี" : "อ่อน";
   const mapUrl = data.gpsValid ? `https://www.google.com/maps?q=${data.latitude},${data.longitude}` : "https://www.google.com/maps";
@@ -226,13 +305,13 @@ export default function Home() {
             <article className="metric"><div className="metric-icon purple"><Icon name="wifi"/></div><span>สัญญาณ Wi-Fi</span><b>{wifiLabel}</b><small>{data.wifiRSSI} dBm</small></article>
             <article className="metric"><div className="metric-icon orange"><Icon name="box"/></div><span>กล่องของฉัน</span><b>{data.device || "BOX-001"}</b><small>พร้อมสำหรับการขนส่ง</small></article>
           </section>
-          <section className="panel split-panel"><div><div className="section-head"><div><p className="eyebrow">TEMPERATURE TREND</p><h3>อุณหภูมิย้อนหลัง</h3></div><span className="range-chip">ล่าสุด 24 ค่า</span></div><MiniChart points={history}/></div><div className="quick-panel"><p className="eyebrow">QUICK ACTION</p><h3>เริ่มการจัดส่งใหม่</h3><p>ตรวจสอบกล่องและสร้างรายการจัดส่งสำหรับสิ่งส่งตรวจ</p><button className="primary" onClick={() => setView("scan")}>สแกน QR กล่อง <span>→</span></button><button className="text-btn" onClick={() => setView("delivery")}>ดูการจัดส่งปัจจุบัน</button></div></section>
+          <section className="panel split-panel"><div><div className="section-head"><div><p className="eyebrow">TEMPERATURE TREND</p><h3>อุณหภูมิตั้งแต่เริ่มระบบ</h3></div><span className="range-chip">ทุก 5 นาที</span></div><MiniChart points={chartPoints} startedAt={systemStartedAt}/></div><div className="quick-panel"><p className="eyebrow">QUICK ACTION</p><h3>เริ่มการจัดส่งใหม่</h3><p>ตรวจสอบกล่องและสร้างรายการจัดส่งสำหรับสิ่งส่งตรวจ</p><button className="primary" onClick={() => setView("scan")}>สแกน QR กล่อง <span>→</span></button><button className="text-btn" onClick={() => setView("delivery")}>ดูการจัดส่งปัจจุบัน</button></div></section>
         </>}
 
         {view === "delivery" && <>
           <section className="delivery-banner"><div><p className="eyebrow">ACTIVE SHIPMENT</p><h2>MCB-2026-001</h2><p>ตัวอย่างเลือด · {data.device}</p></div><span className="delivery-status"><i/>กำลังขนส่ง</span></section>
           <section className="delivery-layout"><article className="panel map-panel"><div className="section-head"><div><p className="eyebrow">LIVE LOCATION</p><h3>ตำแหน่งกล่อง</h3></div><span className={data.gpsValid ? "gps-ok" : "gps-wait"}>{data.gpsValid ? `${data.satellites} ดาวเทียม` : "รอสัญญาณ GPS"}</span></div>{data.gpsValid ? <div className="google-map"><iframe title={`ตำแหน่ง ${data.device}`} src={mapEmbedUrl} loading="lazy" referrerPolicy="no-referrer-when-downgrade"/><div className="map-card"><b>{data.device}</b><span>{data.latitude.toFixed(5)}, {data.longitude.toFixed(5)}</span></div></div> : <div className="map-placeholder"><div className="map-grid"/><span className="map-pin">M</span><div className="map-card"><b>{data.device}</b><span>ยังไม่มีตำแหน่ง — นำ GPS ออกที่โล่ง</span></div></div>}<a className="primary map-button" href={mapUrl} target="_blank" rel="noreferrer">เปิดเต็มจอใน Google Maps <span>↗</span></a></article><article className="panel route-panel"><p className="eyebrow">DELIVERY ROUTE</p><h3>รายละเอียดเส้นทาง</h3><div className="route"><div className="route-line"><i/><span/><i/></div><div><b>โรงพยาบาลต้นทาง</b><p>จุดรับสิ่งส่งตรวจ</p><small>ออกเดินทาง 10:00 น.</small><b>ห้องปฏิบัติการปลายทาง</b><p>จุดส่งสิ่งส่งตรวจ</p><small>คาดว่าจะถึง 11:20 น.</small></div></div><div className="shipment-temp"><span>อุณหภูมิปัจจุบัน</span><b>{data.temperature.toFixed(2)}°C</b><small className={statusClass}>{statusCopy[status]}</small></div></article></section>
-          <section className="panel"><div className="section-head"><div><p className="eyebrow">COLD-CHAIN RECORD</p><h3>กราฟอุณหภูมิระหว่างขนส่ง</h3></div><span className="range-chip">เป้าหมาย 2–8°C</span></div><MiniChart points={history}/></section>
+          <section className="panel"><div className="section-head"><div><p className="eyebrow">COLD-CHAIN RECORD</p><h3>กราฟอุณหภูมิระหว่างขนส่ง</h3></div><span className="range-chip">เป้าหมาย 2–8°C</span></div><MiniChart points={chartPoints} startedAt={systemStartedAt}/></section>
         </>}
 
         {view === "scan" && <section className="scanner-layout"><article className="panel scanner-card"><div className="scanner-title"><span className="scan-symbol">⌗</span><p className="eyebrow">PAIR A BOX</p><h2>สแกน QR ที่กล่อง</h2><p>วาง QR Code ให้อยู่ในกรอบเพื่อเชื่อมต่อกับ {data.device}</p></div><div className={`scanner-window ${cameraOn ? "camera" : ""}`}><video ref={videoRef} playsInline muted/><div className="scan-frame"><i/><i/><i/><i/></div>{!cameraOn && <div className="camera-placeholder"><span>⌗</span><small>กล้องยังไม่เปิด</small></div>}</div><button className="primary full" onClick={cameraOn ? () => finishScan("BOX-001") : startScanner}>{cameraOn ? "ยืนยัน BOX-001" : "เปิดกล้องสแกน QR"}</button><button className="text-btn" onClick={() => finishScan("BOX-001")}>ทดสอบด้วย BOX-001</button></article><article className="panel scan-info"><p className="eyebrow">BOX QR CODE</p><h3>QR สำหรับติดบนกล่อง</h3><div className="qr-identity"><img src={qrImageUrl} alt="QR Code BOX-001" width="230" height="230"/><div><span>รหัสภายใน QR</span><b>BOX-001</b><small>พิมพ์หรือติด QR นี้บนกล่อง MediCool</small></div><a className="secondary qr-download" href={qrImageUrl} target="_blank" rel="noreferrer">เปิด QR เพื่อบันทึกหรือพิมพ์</a></div><div className="scan-divider"/><p className="eyebrow">SCAN RESULT</p><h3>{scanResult === "BOX-001" ? "เชื่อมต่อกล่องสำเร็จ" : "ข้อมูลหลังการสแกน"}</h3>{scanResult === "BOX-001" ? <div className="box-result"><div className="box-visual"><span>M</span></div><div><span>รหัสกล่อง</span><b>{data.device}</b><small className={statusClass}>{statusCopy[status]}</small></div><dl><div><dt>อุณหภูมิ</dt><dd>{data.temperature.toFixed(2)}°C</dd></div><div><dt>Cooling</dt><dd>{data.coolingText}</dd></div><div><dt>GPS</dt><dd>{data.gpsValid ? "พร้อม" : "ค้นหา"}</dd></div></dl><button className="primary full" onClick={() => setView("home")}>เปิด Dashboard</button></div> : <div className="scan-ready"><p>{scanResult || "สแกน QR ทางซ้ายเพื่อเชื่อมต่อกล่อง"}</p><small>บนมือถือให้อนุญาตการใช้งานกล้องเมื่อเบราว์เซอร์ถาม</small></div>}</article></section>}
