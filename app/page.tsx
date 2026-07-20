@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const appBasePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
+const lastValidTemperatureKey = "medicool.lastValidTemperature";
 
 const firebaseConfig = {
   apiKey: "AIzaSyBN0ofEm-yUzno7F7tJB0DEQCLrKlb4fP0",
@@ -97,6 +98,7 @@ export default function Home() {
   const [online, setOnline] = useState(false);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
   const [history, setHistory] = useState<number[]>([]);
+  const lastValidTemperatureRef = useRef(fallback.temperature);
   const [greeting, setGreeting] = useState("สวัสดี");
   const [scanResult, setScanResult] = useState("");
   const [cameraOn, setCameraOn] = useState(false);
@@ -105,6 +107,10 @@ export default function Home() {
 
   useEffect(() => {
     if ("serviceWorker" in navigator) navigator.serviceWorker.register(`${appBasePath}/sw.js`).catch(() => undefined);
+    const storedTemperature = Number(window.localStorage.getItem(lastValidTemperatureKey));
+    if (Number.isFinite(storedTemperature) && storedTemperature > -126 && storedTemperature <= 100) {
+      lastValidTemperatureRef.current = storedTemperature;
+    }
     let active = true;
     const load = async () => {
       try {
@@ -112,10 +118,20 @@ export default function Home() {
         if (!response.ok) throw new Error("Firebase unavailable");
         const next = await response.json();
         if (!active || !next) return;
-        setData({ ...fallback, ...next });
+        const rawTemperature = Number(next.temperature);
+        const temperatureIsValid = Number.isFinite(rawTemperature)
+          && rawTemperature > -126
+          && rawTemperature <= 100
+          && next.sensorOK !== false;
+        if (temperatureIsValid) {
+          lastValidTemperatureRef.current = rawTemperature;
+          window.localStorage.setItem(lastValidTemperatureKey, String(rawTemperature));
+        }
+        const displayTemperature = temperatureIsValid ? rawTemperature : lastValidTemperatureRef.current;
+        setData({ ...fallback, ...next, temperature: displayTemperature });
         setOnline(true);
         setLastUpdate(new Date());
-        if (typeof next.temperature === "number") setHistory(old => [...old, next.temperature].slice(-24));
+        setHistory(old => [...old, displayTemperature].slice(-24));
       } catch {
         if (active) setOnline(false);
       }
