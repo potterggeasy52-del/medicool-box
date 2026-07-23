@@ -36,7 +36,34 @@ type TemperaturePoint = {
   timestamp: number;
 };
 
+type ShipmentStage = "READY" | "IN_TRANSIT" | "DELIVERED";
+
+type ShipmentData = {
+  id: string;
+  boxId: string;
+  cargo: string;
+  origin: string;
+  destination: string;
+  stage: ShipmentStage;
+  startedAt: number | null;
+  deliveredAt: number | null;
+  handoverCount: number;
+};
+
 const historySampleInterval = 5 * 60 * 1000;
+const shipmentStorageKey = "medicool.activeShipment";
+
+const defaultShipment: ShipmentData = {
+  id: "MCB-2026-001",
+  boxId: "BOX-001",
+  cargo: "สิ่งส่งตรวจทางห้องปฏิบัติการ",
+  origin: "โรงพยาบาลต้นทาง",
+  destination: "ห้องปฏิบัติการปลายทาง",
+  stage: "READY",
+  startedAt: null,
+  deliveredAt: null,
+  handoverCount: 0,
+};
 
 const fallback: BoxData = {
   temperature: 8.25,
@@ -132,6 +159,7 @@ export default function Home() {
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
   const [history, setHistory] = useState<TemperaturePoint[]>([]);
   const [systemStartedAt, setSystemStartedAt] = useState(Date.now());
+  const [shipment, setShipment] = useState<ShipmentData>(defaultShipment);
   const lastValidTemperatureRef = useRef(fallback.temperature);
   const lastSavedHistoryBucketRef = useRef<number | null>(null);
   const [greeting, setGreeting] = useState("สวัสดี");
@@ -212,6 +240,35 @@ export default function Home() {
     return () => { active = false; window.clearInterval(timer); };
   }, []);
 
+  useEffect(() => {
+    let active = true;
+    const restoreShipment = async () => {
+      const stored = window.localStorage.getItem(shipmentStorageKey);
+      if (stored) {
+        try {
+          const parsed = JSON.parse(stored) as ShipmentData;
+          if (parsed?.id === defaultShipment.id) setShipment({ ...defaultShipment, ...parsed });
+        } catch {
+          window.localStorage.removeItem(shipmentStorageKey);
+        }
+      }
+      try {
+        const response = await fetch(`${firebaseConfig.databaseURL}/Shipments/${defaultShipment.id}.json?ts=${Date.now()}`, { cache: "no-store" });
+        if (!response.ok) return;
+        const remote = await response.json();
+        if (active && remote) {
+          const restored = { ...defaultShipment, ...remote } as ShipmentData;
+          setShipment(restored);
+          window.localStorage.setItem(shipmentStorageKey, JSON.stringify(restored));
+        }
+      } catch {
+        // The local shipment remains usable during a temporary network outage.
+      }
+    };
+    restoreShipment();
+    return () => { active = false; };
+  }, []);
+
   useEffect(() => () => streamRef.current?.getTracks().forEach(track => track.stop()), []);
 
   useEffect(() => {
@@ -230,6 +287,34 @@ export default function Home() {
     if (!lastPoint || liveTimestamp > lastPoint.timestamp) combined.push(livePoint);
     return combined;
   }, [history, data.temperature, lastUpdate]);
+  const shipmentPoints = useMemo(() => {
+    const start = shipment.startedAt ?? 0;
+    const filtered = chartPoints.filter(point => point.timestamp >= start && point.temperature >= 0 && point.temperature <= 40);
+    return filtered.length ? filtered : chartPoints.slice(-1);
+  }, [chartPoints, shipment.startedAt]);
+  const coldChainMetrics = useMemo(() => {
+    const values = shipmentPoints.map(point => point.temperature);
+    const compliant = values.filter(value => value >= 2 && value <= 8).length;
+    let excursions = 0;
+    let wasOutside = false;
+    values.forEach(value => {
+      const outside = value < 2 || value > 8;
+      if (outside && !wasOutside) excursions += 1;
+      wasOutside = outside;
+    });
+    return {
+      compliance: values.length ? (compliant / values.length) * 100 : 0,
+      minimum: values.length ? Math.min(...values) : data.temperature,
+      maximum: values.length ? Math.max(...values) : data.temperature,
+      excursions,
+    };
+  }, [shipmentPoints, data.temperature]);
+  const stageCopy: Record<ShipmentStage, string> = { READY: "รอรับสิ่งส่งตรวจ", IN_TRANSIT: "กำลังขนส่ง", DELIVERED: "ส่งมอบสำเร็จ" };
+  const stageClass = shipment.stage === "DELIVERED" ? "delivered" : shipment.stage === "IN_TRANSIT" ? "transit" : "ready";
+  const transitEnd = shipment.deliveredAt ?? lastUpdate?.getTime() ?? Date.now();
+  const transitMinutes = shipment.startedAt ? Math.max(0, Math.floor((transitEnd - shipment.startedAt) / 60000)) : 0;
+  const etaTimestamp = shipment.startedAt ? shipment.startedAt + 80 * 60000 : null;
+  const formatClock = (timestamp: number | null) => timestamp ? new Date(timestamp).toLocaleTimeString("th-TH", { hour: "2-digit", minute: "2-digit" }) : "—";
   const statusClass = status === "NORMAL" ? "normal" : status === "HIGH" ? "high" : "warning";
   const wifiLabel = data.wifiRSSI >= -50 ? "ดีมาก" : data.wifiRSSI >= -67 ? "ดี" : "อ่อน";
   const mapUrl = data.gpsValid ? `https://www.google.com/maps?q=${data.latitude},${data.longitude}` : "https://www.google.com/maps";
@@ -237,15 +322,45 @@ export default function Home() {
     ? `https://maps.google.com/maps?q=${data.latitude},${data.longitude}&z=16&output=embed`
     : "";
   const qrImageUrl = `${appBasePath}/medicool-box-qr.png`;
+
+  function saveShipment(next: ShipmentData) {
+    setShipment(next);
+    window.localStorage.setItem(shipmentStorageKey, JSON.stringify(next));
+    fetch(`${firebaseConfig.databaseURL}/Shipments/${next.id}.json`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(next),
+    }).catch(() => undefined);
+  }
+
+  function startShipment() {
+    const next = { ...shipment, stage: "IN_TRANSIT" as ShipmentStage, startedAt: Date.now(), deliveredAt: null, handoverCount: 1 };
+    saveShipment(next);
+    setView("delivery");
+  }
+
+  function completeShipment() {
+    const next = { ...shipment, stage: "DELIVERED" as ShipmentStage, deliveredAt: Date.now(), handoverCount: 2 };
+    saveShipment(next);
+    setView("delivery");
+  }
+
+  function resetShipment() {
+    saveShipment({ ...defaultShipment });
+    setScanResult("");
+  }
+
   const notifications = useMemo(() => {
     const items = [];
+    if (shipment.stage === "IN_TRANSIT") items.push({ level: "success", title: "เริ่มการขนส่งแล้ว", detail: `${shipment.id} ออกจาก ${shipment.origin} เวลา ${formatClock(shipment.startedAt)} น.`, time: "การจัดส่ง" });
+    if (shipment.stage === "DELIVERED") items.push({ level: "success", title: "ส่งมอบถึงปลายทางแล้ว", detail: `${shipment.id} ส่งถึง ${shipment.destination} เวลา ${formatClock(shipment.deliveredAt)} น.`, time: "สำเร็จ" });
     if (status === "HIGH") items.push({ level: "critical", title: "อุณหภูมิสูงเกินกำหนด", detail: `${data.temperature.toFixed(2)}°C — ตรวจสอบระบบทำความเย็น`, time: "ขณะนี้" });
     if (status === "LOW") items.push({ level: "warn", title: "อุณหภูมิต่ำกว่าเกณฑ์", detail: `${data.temperature.toFixed(2)}°C — ตรวจสอบสิ่งส่งตรวจ`, time: "ขณะนี้" });
     if (!data.gpsValid) items.push({ level: "info", title: "กำลังค้นหาสัญญาณ GPS", detail: "นำกล่องไปบริเวณที่มองเห็นท้องฟ้า", time: "ล่าสุด" });
     if (!online) items.push({ level: "critical", title: "ขาดการเชื่อมต่อ", detail: "เว็บไซต์ยังแสดงข้อมูลล่าสุดที่ได้รับ", time: "ขณะนี้" });
     if (!items.length) items.push({ level: "success", title: "ระบบทำงานปกติ", detail: "อุณหภูมิและตำแหน่งอยู่ในเกณฑ์", time: "ขณะนี้" });
     return items;
-  }, [status, data.temperature, data.gpsValid, online]);
+  }, [status, data.temperature, data.gpsValid, online, shipment]);
 
   async function startScanner() {
     setScanResult("");
@@ -295,6 +410,24 @@ export default function Home() {
         <header className="topbar"><div><p className="eyebrow">MEDICOOL CONTROL CENTER</p><h1>{view === "home" ? greeting : view === "delivery" ? "ติดตามการจัดส่ง" : view === "scan" ? "สแกนกล่อง" : view === "notifications" ? "การแจ้งเตือน" : "ข้อมูลผู้ดูแล"}</h1></div><div className="sync"><span className={`live-dot ${online ? "" : "offline"}`}/><span>{online ? "ข้อมูลสด" : "ข้อมูลล่าสุด"}<small>{lastUpdate ? lastUpdate.toLocaleTimeString("th-TH", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "กำลังเชื่อมต่อ"}</small></span></div></header>
 
         {view === "home" && <>
+          <section className="logistics-hero">
+            <div className="shipment-heading">
+              <div><p className="eyebrow">ACTIVE HEALTHCARE SHIPMENT</p><h2>{shipment.id}</h2><p>{shipment.cargo} · {shipment.boxId}</p></div>
+              <span className={`shipment-stage ${stageClass}`}><i/>{stageCopy[shipment.stage]}</span>
+            </div>
+            <div className="logistics-route">
+              <div className="route-stop"><span>A</span><div><small>ต้นทาง</small><b>{shipment.origin}</b></div></div>
+              <div className="route-progress"><i/><span/><i/></div>
+              <div className="route-stop destination"><span>B</span><div><small>ปลายทาง</small><b>{shipment.destination}</b></div></div>
+            </div>
+            <div className="shipment-kpis">
+              <div><small>ETA</small><b>{shipment.stage === "DELIVERED" ? `ถึง ${formatClock(shipment.deliveredAt)} น.` : etaTimestamp ? `${formatClock(etaTimestamp)} น.` : "รอเริ่มงาน"}</b></div>
+              <div><small>ระยะเวลาขนส่ง</small><b>{shipment.startedAt ? `${transitMinutes} นาที` : "—"}</b></div>
+              <div><small>Cold-chain compliance</small><b>{coldChainMetrics.compliance.toFixed(1)}%</b></div>
+              <div><small>การส่งมอบ</small><b>{shipment.handoverCount}/2 จุด</b></div>
+              <button className="shipment-link" onClick={() => setView("delivery")}>ติดตามการจัดส่ง <span>→</span></button>
+            </div>
+          </section>
           <section className={`hero ${statusClass}`}>
             <div className="hero-copy"><p className="eyebrow">สถานะกล่องขณะนี้</p><div className="status-pill"><span/>{statusCopy[status] || status}</div><h2><span>{data.temperature.toFixed(2)}</span><sup>°C</sup></h2><p>ช่วงที่แนะนำสำหรับต้นแบบ: 2–8°C</p></div>
             <div className="hero-ring"><div><Icon name="temp"/><b>{status === "NORMAL" ? "อยู่ในเกณฑ์" : "ต้องตรวจสอบ"}</b><small>{data.device}</small></div></div>
@@ -309,12 +442,55 @@ export default function Home() {
         </>}
 
         {view === "delivery" && <>
-          <section className="delivery-banner"><div><p className="eyebrow">ACTIVE SHIPMENT</p><h2>MCB-2026-001</h2><p>ตัวอย่างเลือด · {data.device}</p></div><span className="delivery-status"><i/>กำลังขนส่ง</span></section>
-          <section className="delivery-layout"><article className="panel map-panel"><div className="section-head"><div><p className="eyebrow">LIVE LOCATION</p><h3>ตำแหน่งกล่อง</h3></div><span className={data.gpsValid ? "gps-ok" : "gps-wait"}>{data.gpsValid ? `${data.satellites} ดาวเทียม` : "รอสัญญาณ GPS"}</span></div>{data.gpsValid ? <div className="google-map"><iframe title={`ตำแหน่ง ${data.device}`} src={mapEmbedUrl} loading="lazy" referrerPolicy="no-referrer-when-downgrade"/><div className="map-card"><b>{data.device}</b><span>{data.latitude.toFixed(5)}, {data.longitude.toFixed(5)}</span></div></div> : <div className="map-placeholder"><div className="map-grid"/><span className="map-pin">M</span><div className="map-card"><b>{data.device}</b><span>ยังไม่มีตำแหน่ง — นำ GPS ออกที่โล่ง</span></div></div>}<a className="primary map-button" href={mapUrl} target="_blank" rel="noreferrer">เปิดเต็มจอใน Google Maps <span>↗</span></a></article><article className="panel route-panel"><p className="eyebrow">DELIVERY ROUTE</p><h3>รายละเอียดเส้นทาง</h3><div className="route"><div className="route-line"><i/><span/><i/></div><div><b>โรงพยาบาลต้นทาง</b><p>จุดรับสิ่งส่งตรวจ</p><small>ออกเดินทาง 10:00 น.</small><b>ห้องปฏิบัติการปลายทาง</b><p>จุดส่งสิ่งส่งตรวจ</p><small>คาดว่าจะถึง 11:20 น.</small></div></div><div className="shipment-temp"><span>อุณหภูมิปัจจุบัน</span><b>{data.temperature.toFixed(2)}°C</b><small className={statusClass}>{statusCopy[status]}</small></div></article></section>
-          <section className="panel"><div className="section-head"><div><p className="eyebrow">COLD-CHAIN RECORD</p><h3>กราฟอุณหภูมิระหว่างขนส่ง</h3></div><span className="range-chip">เป้าหมาย 2–8°C</span></div><MiniChart points={chartPoints} startedAt={systemStartedAt}/></section>
+          <section className="delivery-banner">
+            <div><p className="eyebrow">HEALTHCARE LOGISTICS TRACKING</p><h2>{shipment.id}</h2><p>{shipment.cargo} · {shipment.boxId}</p></div>
+            <span className={`delivery-status ${stageClass}`}><i/>{stageCopy[shipment.stage]}</span>
+          </section>
+          <section className="logistics-stats">
+            <article><span>Cold-chain compliance</span><b>{coldChainMetrics.compliance.toFixed(1)}%</b><small>เป้าหมาย 2–8°C</small></article>
+            <article><span>อุณหภูมิต่ำสุด–สูงสุด</span><b>{coldChainMetrics.minimum.toFixed(1)}–{coldChainMetrics.maximum.toFixed(1)}°C</b><small>{coldChainMetrics.excursions} เหตุการณ์นอกช่วง</small></article>
+            <article><span>เวลาขนส่ง</span><b>{shipment.startedAt ? `${transitMinutes} นาที` : "ยังไม่เริ่ม"}</b><small>ETA {etaTimestamp ? `${formatClock(etaTimestamp)} น.` : "—"}</small></article>
+            <article><span>Chain of Custody</span><b>{shipment.handoverCount}/2</b><small>จุดรับ–ส่งที่ยืนยันแล้ว</small></article>
+          </section>
+          <section className="delivery-layout">
+            <article className="panel map-panel">
+              <div className="section-head"><div><p className="eyebrow">LIVE LOCATION</p><h3>ตำแหน่งกล่องระหว่างขนส่ง</h3></div><span className={data.gpsValid ? "gps-ok" : "gps-wait"}>{data.gpsValid ? `${data.satellites} ดาวเทียม` : "รอสัญญาณ GPS"}</span></div>
+              {data.gpsValid ? <div className="google-map"><iframe title={`ตำแหน่ง ${data.device}`} src={mapEmbedUrl} loading="lazy" referrerPolicy="no-referrer-when-downgrade"/><div className="map-card"><b>{data.device}</b><span>{data.latitude.toFixed(5)}, {data.longitude.toFixed(5)}</span></div></div> : <div className="map-placeholder"><div className="map-grid"/><span className="map-pin">M</span><div className="map-card"><b>{data.device}</b><span>ยังไม่มีตำแหน่ง — นำ GPS ออกที่โล่ง</span></div></div>}
+              <a className="primary map-button" href={mapUrl} target="_blank" rel="noreferrer">เปิดเต็มจอใน Google Maps <span>↗</span></a>
+            </article>
+            <article className="panel custody-panel">
+              <p className="eyebrow">CHAIN OF CUSTODY</p><h3>ลำดับการรับ–ส่งสิ่งส่งตรวจ</h3>
+              <div className={`custody-step ${shipment.stage !== "READY" ? "complete" : "active"}`}><span>1</span><div><b>เตรียมกล่องและสิ่งส่งตรวจ</b><small>{shipment.origin}</small></div><time>พร้อม</time></div>
+              <div className={`custody-step ${shipment.stage === "DELIVERED" ? "complete" : shipment.stage === "IN_TRANSIT" ? "active" : ""}`}><span>2</span><div><b>ผู้ขนส่งสแกนรับกล่อง</b><small>เริ่มติดตามอุณหภูมิและ GPS</small></div><time>{formatClock(shipment.startedAt)}</time></div>
+              <div className={`custody-step ${shipment.stage === "DELIVERED" ? "complete" : ""}`}><span>3</span><div><b>ปลายทางยืนยันรับมอบ</b><small>{shipment.destination}</small></div><time>{formatClock(shipment.deliveredAt)}</time></div>
+              <div className="shipment-temp"><span>อุณหภูมิปัจจุบัน</span><b>{data.temperature.toFixed(2)}°C</b><small className={statusClass}>{statusCopy[status]}</small></div>
+              {shipment.stage === "READY" && <button className="primary full" onClick={() => setView("scan")}>สแกน QR เพื่อเริ่มขนส่ง <span>→</span></button>}
+              {shipment.stage === "IN_TRANSIT" && <button className="primary full" onClick={() => setView("scan")}>สแกน QR ที่ปลายทาง <span>→</span></button>}
+              {shipment.stage === "DELIVERED" && <button className="secondary full" onClick={resetShipment}>เริ่มรอบสาธิตใหม่</button>}
+            </article>
+          </section>
+          <section className="panel"><div className="section-head"><div><p className="eyebrow">COLD-CHAIN RECORD</p><h3>หลักฐานอุณหภูมิระหว่างขนส่ง</h3></div><span className="range-chip">Compliance {coldChainMetrics.compliance.toFixed(1)}%</span></div><MiniChart points={chartPoints} startedAt={shipment.startedAt ?? systemStartedAt}/></section>
         </>}
 
-        {view === "scan" && <section className="scanner-layout"><article className="panel scanner-card"><div className="scanner-title"><span className="scan-symbol">⌗</span><p className="eyebrow">PAIR A BOX</p><h2>สแกน QR ที่กล่อง</h2><p>วาง QR Code ให้อยู่ในกรอบเพื่อเชื่อมต่อกับ {data.device}</p></div><div className={`scanner-window ${cameraOn ? "camera" : ""}`}><video ref={videoRef} playsInline muted/><div className="scan-frame"><i/><i/><i/><i/></div>{!cameraOn && <div className="camera-placeholder"><span>⌗</span><small>กล้องยังไม่เปิด</small></div>}</div><button className="primary full" onClick={cameraOn ? () => finishScan("BOX-001") : startScanner}>{cameraOn ? "ยืนยัน BOX-001" : "เปิดกล้องสแกน QR"}</button><button className="text-btn" onClick={() => finishScan("BOX-001")}>ทดสอบด้วย BOX-001</button></article><article className="panel scan-info"><p className="eyebrow">BOX QR CODE</p><h3>QR สำหรับติดบนกล่อง</h3><div className="qr-identity"><img src={qrImageUrl} alt="QR Code BOX-001" width="230" height="230"/><div><span>รหัสภายใน QR</span><b>BOX-001</b><small>พิมพ์หรือติด QR นี้บนกล่อง MediCool</small></div><a className="secondary qr-download" href={qrImageUrl} target="_blank" rel="noreferrer">เปิด QR เพื่อบันทึกหรือพิมพ์</a></div><div className="scan-divider"/><p className="eyebrow">SCAN RESULT</p><h3>{scanResult === "BOX-001" ? "เชื่อมต่อกล่องสำเร็จ" : "ข้อมูลหลังการสแกน"}</h3>{scanResult === "BOX-001" ? <div className="box-result"><div className="box-visual"><span>M</span></div><div><span>รหัสกล่อง</span><b>{data.device}</b><small className={statusClass}>{statusCopy[status]}</small></div><dl><div><dt>อุณหภูมิ</dt><dd>{data.temperature.toFixed(2)}°C</dd></div><div><dt>Cooling</dt><dd>{data.coolingText}</dd></div><div><dt>GPS</dt><dd>{data.gpsValid ? "พร้อม" : "ค้นหา"}</dd></div></dl><button className="primary full" onClick={() => setView("home")}>เปิด Dashboard</button></div> : <div className="scan-ready"><p>{scanResult || "สแกน QR ทางซ้ายเพื่อเชื่อมต่อกล่อง"}</p><small>บนมือถือให้อนุญาตการใช้งานกล้องเมื่อเบราว์เซอร์ถาม</small></div>}</article></section>}
+        {view === "scan" && <section className="scanner-layout">
+          <article className="panel scanner-card">
+            <div className="scanner-title"><span className="scan-symbol">⌗</span><p className="eyebrow">LOGISTICS HANDOVER</p><h2>{shipment.stage === "READY" ? "สแกนรับกล่องที่ต้นทาง" : shipment.stage === "IN_TRANSIT" ? "สแกนส่งมอบที่ปลายทาง" : "ตรวจสอบ QR ของกล่อง"}</h2><p>การสแกนแต่ละครั้งจะบันทึกจุดส่งต่อใน Chain of Custody ของ {shipment.id}</p></div>
+            <div className={`scanner-window ${cameraOn ? "camera" : ""}`}><video ref={videoRef} playsInline muted/><div className="scan-frame"><i/><i/><i/><i/></div>{!cameraOn && <div className="camera-placeholder"><span>⌗</span><small>กล้องยังไม่เปิด</small></div>}</div>
+            <button className="primary full" onClick={cameraOn ? () => finishScan("BOX-001") : startScanner}>{cameraOn ? "ยืนยัน BOX-001" : "เปิดกล้องสแกน QR"}</button>
+            <button className="text-btn" onClick={() => finishScan("BOX-001")}>โหมดสาธิต: จำลองการสแกน BOX-001</button>
+          </article>
+          <article className="panel scan-info">
+            <p className="eyebrow">CHAIN OF CUSTODY</p><h3>{scanResult === "BOX-001" ? "ตรวจพบกล่องที่ลงทะเบียน" : "ข้อมูลสำหรับการรับ–ส่ง"}</h3>
+            {scanResult === "BOX-001" ? <div className="box-result">
+              <div className="handover-card"><span className={`shipment-stage ${stageClass}`}><i/>{stageCopy[shipment.stage]}</span><b>{shipment.id}</b><p>{shipment.origin} → {shipment.destination}</p></div>
+              <div><span>รหัสกล่อง</span><b>{data.device}</b><small className={statusClass}>{statusCopy[status]}</small></div>
+              <dl><div><dt>อุณหภูมิ</dt><dd>{data.temperature.toFixed(2)}°C</dd></div><div><dt>Cold-chain</dt><dd>{coldChainMetrics.compliance.toFixed(1)}%</dd></div><div><dt>GPS</dt><dd>{data.gpsValid ? "พร้อม" : "ค้นหา"}</dd></div></dl>
+              {shipment.stage === "READY" && <button className="primary full" onClick={startShipment}>ยืนยันรับกล่องและเริ่มขนส่ง <span>→</span></button>}
+              {shipment.stage === "IN_TRANSIT" && <button className="primary full" onClick={completeShipment}>ยืนยันส่งมอบถึงปลายทาง <span>✓</span></button>}
+              {shipment.stage === "DELIVERED" && <><div className="delivery-proof"><b>ส่งมอบสำเร็จ</b><span>{formatClock(shipment.deliveredAt)} น. · ครบ {shipment.handoverCount}/2 จุด</span></div><button className="secondary full" onClick={() => setView("delivery")}>ดูสรุปการขนส่ง</button></>}
+            </div> : <div className="qr-identity"><img src={qrImageUrl} alt="QR Code BOX-001" width="230" height="230"/><div><span>QR ประจำกล่อง</span><b>BOX-001</b><small>ใช้ QR เดียวกันเพื่อยืนยันรับของและส่งมอบ</small></div><a className="secondary qr-download" href={qrImageUrl} target="_blank" rel="noreferrer">เปิด QR เพื่อบันทึกหรือพิมพ์</a></div>}
+          </article>
+        </section>}
 
         {view === "notifications" && <section className="notifications-layout"><div className="notification-summary"><div><p className="eyebrow">SYSTEM EVENTS</p><h2>{notifications.length} รายการล่าสุด</h2></div><div className="summary-ring"><b>{notifications.filter(n => n.level === "critical").length}</b><span>เร่งด่วน</span></div></div><div className="notification-list">{notifications.map((item, index) => <article key={index} className={`notification ${item.level}`}><span className="notification-mark"/><div><b>{item.title}</b><p>{item.detail}</p></div><time>{item.time}</time></article>)}</div><article className="panel alert-guide"><p className="eyebrow">ACTION GUIDE</p><h3>เมื่อได้รับการแจ้งเตือน</h3><div className="guide-grid"><div><b>1</b><span>ตรวจสอบฝาและแหล่งจ่ายไฟ</span></div><div><b>2</b><span>ตรวจสอบพัดลมและ Peltier</span></div><div><b>3</b><span>ติดต่อผู้ขนส่งและปลายทาง</span></div></div></article></section>}
 
