@@ -410,24 +410,6 @@ export default function Home() {
         <header className="topbar"><div><p className="eyebrow">MEDICOOL CONTROL CENTER</p><h1>{view === "home" ? greeting : view === "delivery" ? "ติดตามการจัดส่ง" : view === "scan" ? "สแกนกล่อง" : view === "notifications" ? "การแจ้งเตือน" : "ข้อมูลผู้ดูแล"}</h1></div><div className="sync"><span className={`live-dot ${online ? "" : "offline"}`}/><span>{online ? "ข้อมูลสด" : "ข้อมูลล่าสุด"}<small>{lastUpdate ? lastUpdate.toLocaleTimeString("th-TH", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "กำลังเชื่อมต่อ"}</small></span></div></header>
 
         {view === "home" && <>
-          <section className="logistics-hero">
-            <div className="shipment-heading">
-              <div><p className="eyebrow">ACTIVE HEALTHCARE SHIPMENT</p><h2>{shipment.id}</h2><p>{shipment.cargo} · {shipment.boxId}</p></div>
-              <span className={`shipment-stage ${stageClass}`}><i/>{stageCopy[shipment.stage]}</span>
-            </div>
-            <div className="logistics-route">
-              <div className="route-stop"><span>A</span><div><small>ต้นทาง</small><b>{shipment.origin}</b></div></div>
-              <div className="route-progress"><i/><span/><i/></div>
-              <div className="route-stop destination"><span>B</span><div><small>ปลายทาง</small><b>{shipment.destination}</b></div></div>
-            </div>
-            <div className="shipment-kpis">
-              <div><small>ETA</small><b>{shipment.stage === "DELIVERED" ? `ถึง ${formatClock(shipment.deliveredAt)} น.` : etaTimestamp ? `${formatClock(etaTimestamp)} น.` : "รอเริ่มงาน"}</b></div>
-              <div><small>ระยะเวลาขนส่ง</small><b>{shipment.startedAt ? `${transitMinutes} นาที` : "—"}</b></div>
-              <div><small>Cold-chain compliance</small><b>{coldChainMetrics.compliance.toFixed(1)}%</b></div>
-              <div><small>การส่งมอบ</small><b>{shipment.handoverCount}/2 จุด</b></div>
-              <button className="shipment-link" onClick={() => setView("delivery")}>ติดตามการจัดส่ง <span>→</span></button>
-            </div>
-          </section>
           <section className={`hero ${statusClass}`}>
             <div className="hero-copy"><p className="eyebrow">สถานะกล่องขณะนี้</p><div className="status-pill"><span/>{statusCopy[status] || status}</div><h2><span>{data.temperature.toFixed(2)}</span><sup>°C</sup></h2><p>ช่วงที่แนะนำสำหรับต้นแบบ: 2–8°C</p></div>
             <div className="hero-ring"><div><Icon name="temp"/><b>{status === "NORMAL" ? "อยู่ในเกณฑ์" : "ต้องตรวจสอบ"}</b><small>{data.device}</small></div></div>
