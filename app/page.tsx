@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import jsQR from "jsqr";
 
 const appBasePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const lastValidTemperatureKey = "medicool.lastValidTemperature";
@@ -164,9 +165,11 @@ export default function Home() {
   const lastSavedHistoryBucketRef = useRef<number | null>(null);
   const [greeting, setGreeting] = useState("สวัสดี");
   const [scanResult, setScanResult] = useState("");
+  const [scanMessage, setScanMessage] = useState("กดเปิดกล้อง แล้วเล็ง QR ให้อยู่ในกรอบ");
   const [cameraOn, setCameraOn] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const scanFrameRef = useRef<number | null>(null);
 
   useEffect(() => {
     if ("serviceWorker" in navigator) navigator.serviceWorker.register(`${appBasePath}/sw.js`).catch(() => undefined);
@@ -269,7 +272,20 @@ export default function Home() {
     return () => { active = false; };
   }, []);
 
-  useEffect(() => () => streamRef.current?.getTracks().forEach(track => track.stop()), []);
+  useEffect(() => () => {
+    if (scanFrameRef.current !== null) window.cancelAnimationFrame(scanFrameRef.current);
+    streamRef.current?.getTracks().forEach(track => track.stop());
+  }, []);
+
+  useEffect(() => {
+    if (view !== "scan") {
+      if (scanFrameRef.current !== null) window.cancelAnimationFrame(scanFrameRef.current);
+      scanFrameRef.current = null;
+      streamRef.current?.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+      setCameraOn(false);
+    }
+  }, [view]);
 
   useEffect(() => {
     const updateGreeting = () => setGreeting(greetingForHour(new Date().getHours()));
@@ -362,36 +378,90 @@ export default function Home() {
     return items;
   }, [status, data.temperature, data.gpsValid, online, shipment]);
 
+  function stopScanner() {
+    if (scanFrameRef.current !== null) window.cancelAnimationFrame(scanFrameRef.current);
+    scanFrameRef.current = null;
+    streamRef.current?.getTracks().forEach(track => track.stop());
+    streamRef.current = null;
+    setCameraOn(false);
+  }
+
   async function startScanner() {
+    stopScanner();
     setScanResult("");
+    setScanMessage("กำลังเปิดกล้อง…");
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
       streamRef.current = stream;
       setCameraOn(true);
-      if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play(); }
-      const Detector = (window as unknown as { BarcodeDetector?: new (opts: {formats: string[]}) => {detect: (video: HTMLVideoElement) => Promise<Array<{rawValue: string}>>} }).BarcodeDetector;
-      if (Detector && videoRef.current) {
-        const detector = new Detector({ formats: ["qr_code"] });
-        const scan = async () => {
-          if (!streamRef.current || !videoRef.current) return;
-          const codes = await detector.detect(videoRef.current).catch(() => []);
-          if (codes[0]) { finishScan(codes[0].rawValue); return; }
-          requestAnimationFrame(scan);
-        };
-        requestAnimationFrame(scan);
-      }
-    } catch { setScanResult("ไม่สามารถเปิดกล้องได้ — ใช้ปุ่มทดสอบ BOX-001 แทน"); }
+      const video = videoRef.current;
+      if (!video) throw new Error("Camera preview unavailable");
+      video.srcObject = stream;
+      await video.play();
+      setScanMessage("กำลังสแกน… เล็ง QR ให้อยู่ในกรอบและถือให้นิ่ง");
+
+      const canvas = document.createElement("canvas");
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      if (!context) throw new Error("QR canvas unavailable");
+
+      let lastDecodeAt = 0;
+      const scan = (timestamp: number) => {
+        const currentVideo = videoRef.current;
+        if (!streamRef.current || !currentVideo) return;
+
+        if (
+          timestamp - lastDecodeAt >= 120
+          && currentVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
+          && currentVideo.videoWidth > 0
+          && currentVideo.videoHeight > 0
+        ) {
+          lastDecodeAt = timestamp;
+          const scale = Math.min(1, 720 / currentVideo.videoWidth);
+          canvas.width = Math.max(1, Math.round(currentVideo.videoWidth * scale));
+          canvas.height = Math.max(1, Math.round(currentVideo.videoHeight * scale));
+          context.drawImage(currentVideo, 0, 0, canvas.width, canvas.height);
+          const frame = context.getImageData(0, 0, canvas.width, canvas.height);
+          const decoded = jsQR(frame.data, frame.width, frame.height, { inversionAttempts: "attemptBoth" });
+          if (decoded?.data) {
+            finishScan(decoded.data);
+            return;
+          }
+        }
+
+        scanFrameRef.current = window.requestAnimationFrame(scan);
+      };
+      scanFrameRef.current = window.requestAnimationFrame(scan);
+    } catch {
+      stopScanner();
+      setScanMessage("เปิดกล้องไม่ได้ กรุณาอนุญาตใช้กล้อง หรือใช้ปุ่มโหมดสาธิตด้านล่าง");
+    }
   }
 
   function finishScan(value: string) {
-    streamRef.current?.getTracks().forEach(track => track.stop());
-    streamRef.current = null;
-    setCameraOn(false);
+    stopScanner();
     const normalizedValue = value.trim();
     const normalizedUpper = normalizedValue.toUpperCase();
-    const looksLikeMediCoolLink = /^https?:\/\//i.test(normalizedValue)
-      && (normalizedValue.toLowerCase().includes("medicool") || normalizedValue.includes("potterggeasy52-del.github.io"));
-    setScanResult(normalizedUpper === "BOX-001" || looksLikeMediCoolLink ? "BOX-001" : `ไม่พบกล่อง: ${value}`);
+    let recognizedBox = normalizedUpper === defaultShipment.boxId;
+
+    if (/^https?:\/\//i.test(normalizedValue)) {
+      try {
+        const scannedUrl = new URL(normalizedValue);
+        const boxFromUrl = scannedUrl.searchParams.get("box")?.trim().toUpperCase();
+        const recognizedHost = scannedUrl.hostname.includes("potterggeasy52-del.github.io")
+          || scannedUrl.hostname.toLowerCase().includes("medicool");
+        recognizedBox = recognizedHost && (!boxFromUrl || boxFromUrl === defaultShipment.boxId);
+      } catch {
+        recognizedBox = false;
+      }
+    }
+
+    if (recognizedBox) {
+      setScanResult(defaultShipment.boxId);
+      setScanMessage(`พบ ${defaultShipment.boxId} แล้ว — ตรวจข้อมูลและกดยืนยันการส่งมอบ`);
+    } else {
+      setScanResult(`ไม่พบกล่อง: ${value}`);
+      setScanMessage("QR นี้ไม่ใช่กล่องที่ลงทะเบียน กรุณาลองสแกนอีกครั้ง");
+    }
   }
 
   return (
@@ -458,7 +528,8 @@ export default function Home() {
           <article className="panel scanner-card">
             <div className="scanner-title"><span className="scan-symbol">⌗</span><p className="eyebrow">LOGISTICS HANDOVER</p><h2>{shipment.stage === "READY" ? "สแกนรับกล่องที่ต้นทาง" : shipment.stage === "IN_TRANSIT" ? "สแกนส่งมอบที่ปลายทาง" : "ตรวจสอบ QR ของกล่อง"}</h2><p>การสแกนแต่ละครั้งจะบันทึกจุดส่งต่อใน Chain of Custody ของ {shipment.id}</p></div>
             <div className={`scanner-window ${cameraOn ? "camera" : ""}`}><video ref={videoRef} playsInline muted/><div className="scan-frame"><i/><i/><i/><i/></div>{!cameraOn && <div className="camera-placeholder"><span>⌗</span><small>กล้องยังไม่เปิด</small></div>}</div>
-            <button className="primary full" onClick={cameraOn ? () => finishScan("BOX-001") : startScanner}>{cameraOn ? "ยืนยัน BOX-001" : "เปิดกล้องสแกน QR"}</button>
+            <div className={`scan-feedback ${scanResult === "BOX-001" ? "success" : scanResult ? "error" : cameraOn ? "active" : ""}`} aria-live="polite"><span/>{scanMessage}</div>
+            <button className="primary full" onClick={cameraOn ? stopScanner : startScanner}>{cameraOn ? "หยุดกล้อง" : "เปิดกล้องสแกน QR"}</button>
             <button className="text-btn" onClick={() => finishScan("BOX-001")}>โหมดสาธิต: จำลองการสแกน BOX-001</button>
           </article>
           <article className="panel scan-info">
